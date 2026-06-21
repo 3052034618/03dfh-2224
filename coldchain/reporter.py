@@ -10,6 +10,7 @@ def generate_report(
     waybill: Waybill,
     readings: List[TemperatureReading],
     temp_zone: Optional[TempZone] = None,
+    match_basis: str = "",
 ) -> WaybillReport:
     zone = temp_zone or waybill.temp_zone
     report = WaybillReport(
@@ -20,6 +21,7 @@ def generate_report(
         temp_zone=zone,
         departure_time=waybill.departure_time,
         arrival_time=waybill.arrival_time,
+        match_basis=match_basis,
     )
 
     if not readings:

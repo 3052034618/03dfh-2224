@@ -16,17 +16,33 @@ class TempZone:
             return None
         text = text.strip()
         m = re.match(r"(-?[\d.]+)\s*[~—]+\s*(-?[\d.]+)", text)
-        if not m:
-            m = re.match(r"(-?[\d.]+)\s*--\s*(-?[\d.]+)", text)
-        if not m:
-            m = re.match(r"(-?[\d.]+)\s+-\s+(-?[\d.]+)", text)
         if m:
             low, high = float(m.group(1)), float(m.group(2))
             return TempZone(low=min(low, high), high=max(low, high), raw=text)
-        m = re.match(r"([<>≤≥])\s*(-?[\d.]+)", text)
+        m = re.match(r"(-?[\d.]+)\s+-\s+(-?[\d.]+)", text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            return TempZone(low=min(low, high), high=max(low, high), raw=text)
+        m = re.match(r"(-[\d.]+)\s*-\s*(-?[\d.]+)", text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            return TempZone(low=min(low, high), high=max(low, high), raw=text)
+        m = re.match(r"([\d.]+)\s*-\s*(-[\d.]+)", text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            return TempZone(low=min(low, high), high=max(low, high), raw=text)
+        m = re.match(r"([\d.]+)\s*-\s*([\d.]+)$", text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            return TempZone(low=min(low, high), high=max(low, high), raw=text)
+        m = re.match(r"(-?[\d.]+)\s*--\s*(-?[\d.]+)", text)
+        if m:
+            low, high = float(m.group(1)), float(m.group(2))
+            return TempZone(low=min(low, high), high=max(low, high), raw=text)
+        m = re.match(r"(<=?|>=?|≤|≥)\s*(-?[\d.]+)", text)
         if m:
             op, val = m.group(1), float(m.group(2))
-            if op in ("<", "≤"):
+            if op in ("<", "≤", "<="):
                 return TempZone(low=-999, high=val, raw=text)
             return TempZone(low=val, high=999, raw=text)
         try:
@@ -34,6 +50,9 @@ class TempZone:
             return TempZone(low=val, high=val, raw=text)
         except ValueError:
             return None
+
+    def display(self) -> str:
+        return f"{self.low}~{self.high}℃"
 
     def is_over(self, temp: float) -> bool:
         return temp < self.low or temp > self.high
@@ -61,6 +80,8 @@ class TemperatureReading:
     device_id: str
     timestamp: datetime
     temperature: float
+    waybill_no: str = ""
+    license_plate: str = ""
 
 
 @dataclass
@@ -95,6 +116,7 @@ class WaybillReport:
     over_temp_segments: list = field(default_factory=list)
     key_time_points: list = field(default_factory=list)
     has_data: bool = False
+    match_basis: str = ""
 
 
 @dataclass

@@ -52,6 +52,8 @@ _TEMP_COLUMN_MAP = {
     "device_id": ["设备编号", "设备号", "设备ID", "device_id", "deviceid", "记录仪编号"],
     "timestamp": ["时间", "时间戳", "timestamp", "记录时间", "采集时间"],
     "temperature": ["温度", "温度值", "temperature", "temp", "实时温度"],
+    "waybill_no": ["运单号", "运单编号", "waybill_no", "waybillno", "单号"],
+    "license_plate": ["车牌", "车牌号", "license_plate", "plate", "车号"],
 }
 
 
@@ -164,7 +166,13 @@ def _build_reading(row: dict, col_map: dict, fallback_device: str) -> Optional[T
     temp = _parse_float(_get("temperature"))
     if ts is None or temp is None:
         return None
-    return TemperatureReading(device_id=device_id, timestamp=ts, temperature=temp)
+    return TemperatureReading(
+        device_id=device_id,
+        timestamp=ts,
+        temperature=temp,
+        waybill_no=_get("waybill_no"),
+        license_plate=_get("license_plate"),
+    )
 
 
 def load_temperature_dir(dirpath: str) -> List[TemperatureReading]:
