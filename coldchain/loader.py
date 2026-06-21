@@ -175,13 +175,42 @@ def _build_reading(row: dict, col_map: dict, fallback_device: str) -> Optional[T
     )
 
 
-def load_temperature_dir(dirpath: str) -> List[TemperatureReading]:
+def load_temperature_dir(dirpath: str, recursive: bool = True) -> List[TemperatureReading]:
     all_readings = []
     if not os.path.isdir(dirpath):
         return all_readings
-    for fname in os.listdir(dirpath):
-        fpath = os.path.join(dirpath, fname)
-        if os.path.isfile(fpath) and fname.lower().endswith((".csv", ".xlsx", ".xls")):
-            all_readings.extend(load_temperature_file(fpath))
+    if recursive:
+        for root, _, files in os.walk(dirpath):
+            for fname in sorted(files):
+                if fname.lower().endswith((".csv", ".xlsx", ".xls")):
+                    fpath = os.path.join(root, fname)
+                    all_readings.extend(load_temperature_file(fpath))
+    else:
+        for fname in sorted(os.listdir(dirpath)):
+            fpath = os.path.join(dirpath, fname)
+            if os.path.isfile(fpath) and fname.lower().endswith((".csv", ".xlsx", ".xls")):
+                all_readings.extend(load_temperature_file(fpath))
     all_readings.sort(key=lambda r: r.timestamp)
     return all_readings
+
+
+def find_temperature_files(dirpath: str) -> List[str]:
+    files = []
+    if not os.path.isdir(dirpath):
+        return files
+    for root, _, fnames in os.walk(dirpath):
+        for fname in sorted(fnames):
+            if fname.lower().endswith((".csv", ".xlsx", ".xls")):
+                files.append(os.path.join(root, fname))
+    return files
+
+
+def find_waybill_files(dirpath: str) -> List[str]:
+    files = []
+    if not os.path.isdir(dirpath):
+        return files
+    for fname in sorted(os.listdir(dirpath)):
+        fpath = os.path.join(dirpath, fname)
+        if os.path.isfile(fpath) and fname.lower().endswith((".csv", ".xlsx", ".xls")):
+            files.append(fpath)
+    return files

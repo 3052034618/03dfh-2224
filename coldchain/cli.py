@@ -7,7 +7,7 @@ from typing import Optional, List
 
 import click
 
-from .loader import load_waybills, load_temperature_dir
+from .loader import load_waybills, load_temperature_dir, find_temperature_files, find_waybill_files
 from .matcher import match_waybills_readings
 from .models import TempZone, WaybillReport, ExceptionItem
 from .reporter import generate_report
@@ -24,7 +24,7 @@ _CATEGORY_LABEL = {
 
 
 @click.group()
-@click.version_option("1.1.0", prog_name="coldchain")
+@click.version_option("1.2.0", prog_name="coldchain")
 def cli():
     """冷链运单温度留痕工具 —— 批量整理温度记录，生成留痕报告与异常清单"""
     pass
@@ -189,16 +189,22 @@ def report(waybill_file, temp_dir, customer, temp_zone, output):
         click.echo("温区标准：采用运单清单中的温区")
 
     reports = []
+    all_exceptions = []
     for pair in match_result.matched:
         zone = override_zone or pair.waybill.temp_zone
         r = generate_report(pair.waybill, pair.readings, zone, pair.basis)
         reports.append(r)
         _print_waybill_report(r)
+        items = detect_exceptions(pair.waybill, pair.readings, zone)
+        all_exceptions.extend(items)
 
     for w in match_result.no_temp_data:
+        zone = override_zone or w.temp_zone
         r = generate_report(w, [], override_zone)
         reports.append(r)
         _print_waybill_report(r)
+        items = detect_exceptions(w, [], zone)
+        all_exceptions.extend(items)
 
     click.echo()
     click.echo(f"共 {len(reports)} 票运单"
@@ -208,10 +214,13 @@ def report(waybill_file, temp_dir, customer, temp_zone, output):
     if output:
         _ensure_dir(output)
         if output.lower().endswith((".xlsx", ".xls")):
-            _export_full_excel(output, match_result, reports, override_zone)
+            _export_full_excel(output, match_result, reports, override_zone,
+                               all_exceptions=all_exceptions)
         else:
             _write_report_csv(output, reports)
         click.echo(f"报告已导出 → {output}")
+        if output.lower().endswith((".xlsx", ".xls")) and all_exceptions:
+            click.echo(f"  （包含异常清单页，共 {len(all_exceptions)} 条异常）")
 
 
 def _print_waybill_report(r):
@@ -301,8 +310,10 @@ def _write_report_csv(filepath, reports):
               default="all", help="筛选严重程度")
 @click.option("--output", "-o", default=None, help="异常清单输出文件路径（CSV/XLSX）")
 @click.option("--note-template", "-n", is_flag=True, default=False,
-              help="导出时增加备注列和处理人列，方便回看补说明")
-def exceptions(waybill_file, temp_dir, temp_zone, severity, output, note_template):
+              help="导出时增加备注列、处理人列和处理状态列")
+@click.option("--merge-notes", "-m", "merge_notes_file", default=None,
+              help="已有备注文件路径（CSV/XLSX），导出时保留原说明")
+def exceptions(waybill_file, temp_dir, temp_zone, severity, output, note_template, merge_notes_file):
     """异常清单：按严重程度列出断点、无数据、温度突升等情况"""
     if not os.path.exists(waybill_file):
         click.echo(f"错误：运单文件不存在 → {waybill_file}", err=True)
@@ -323,6 +334,15 @@ def exceptions(waybill_file, temp_dir, temp_zone, severity, output, note_templat
     readings = load_temperature_dir(temp_dir)
 
     match_result = match_waybills_readings(waybills, readings)
+
+    existing_notes = {}
+    if merge_notes_file and note_template:
+        click.echo(f"正在合并已有备注 → {merge_notes_file}")
+        existing_notes = _load_existing_notes(merge_notes_file)
+        if existing_notes:
+            click.echo(f"  已读取 {len(existing_notes)} 条历史备注")
+    elif merge_notes_file and not note_template:
+        click.echo(click.style("  提示：--merge-notes 需要配合 -n 使用才会输出备注列", fg="yellow"))
 
     all_items = []
     for pair in match_result.matched:
@@ -374,16 +394,21 @@ def exceptions(waybill_file, temp_dir, temp_zone, severity, output, note_templat
     if output:
         _ensure_dir(output)
         if output.lower().endswith((".xlsx", ".xls")):
-            _write_excel(output, _build_exception_rows(all_items, note_template),
-                         sheet_name="异常清单")
+            _write_excel(output, _build_exception_rows(all_items, note_template, existing_notes),
+                         sheet_name="异常清单", highlight_severity=True)
         else:
-            _write_exceptions_csv(output, all_items, note_template)
+            _write_exceptions_csv(output, all_items, note_template, existing_notes)
         click.echo(f"异常清单已导出 → {output}")
+        if note_template:
+            click.echo(f"  （含备注模板：处理状态下拉、备注、处理人）")
 
 
-def _build_exception_rows(items, note_template=False):
+def _build_exception_rows(items, note_template=False, existing_notes=None):
+    if existing_notes is None:
+        existing_notes = {}
     rows = []
     for idx, it in enumerate(items, 1):
+        existing = existing_notes.get(it.unique_key(), {})
         row = {
             "序号": idx,
             "严重程度": _SEVERITY_LABEL.get(it.severity, it.severity),
@@ -398,32 +423,138 @@ def _build_exception_rows(items, note_template=False):
             "详情": it.detail,
         }
         if note_template:
-            row["备注"] = ""
-            row["处理人"] = ""
+            row["处理状态"] = existing.get("处理状态", it.status or "")
+            row["备注"] = existing.get("备注", it.remark or "")
+            row["处理人"] = existing.get("处理人", it.handler or "")
         rows.append(row)
     return rows
 
 
-def _write_exceptions_csv(filepath, items, note_template=False):
+def _load_existing_notes(filepath):
+    if not os.path.exists(filepath):
+        return {}
+    notes = {}
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        def _normalize_time(text):
+            text = str(text).strip()
+            if text in ("—", "-", "", "None"):
+                return ""
+            return text
+
+        def _normalize_mins(text):
+            text = str(text).strip()
+            if not text:
+                return ""
+            try:
+                return f"{float(text):.1f}"
+            except ValueError:
+                return text
+
+        def _normalize_temp(text):
+            text = str(text).strip()
+            if not text:
+                return ""
+            try:
+                val = float(text)
+                if val == int(val):
+                    return str(int(val))
+                return str(val)
+            except ValueError:
+                return text
+
+        if ext == ".csv":
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    wb_no = str(row.get("运单号", "")).strip()
+                    sev = str(row.get("严重程度", "")).strip()
+                    cat = str(row.get("类别", "")).strip()
+                    start = _normalize_time(row.get("开始时间", ""))
+                    end = _normalize_time(row.get("结束时间", ""))
+                    mins = _normalize_mins(row.get("时长(分钟)", ""))
+                    temp = _normalize_temp(row.get("温度(℃)", ""))
+                    key = f"{wb_no}|{_reverse_severity(sev)}|{_reverse_category(cat)}|{start}|{end}|{mins}|{temp}"
+                    notes[key] = {
+                        "处理状态": str(row.get("处理状态", "")).strip(),
+                        "备注": str(row.get("备注", "")).strip(),
+                        "处理人": str(row.get("处理人", "")).strip(),
+                    }
+        elif ext in (".xlsx", ".xls"):
+            import openpyxl
+            wb = openpyxl.load_workbook(filepath, read_only=True)
+            for ws_name in wb.sheetnames:
+                ws = wb[ws_name]
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    continue
+                headers = [str(h).strip() if h else "" for h in rows[0]]
+                if "运单号" not in headers or "严重程度" not in headers:
+                    continue
+                for row in rows[1:]:
+                    row_dict = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+                    wb_no = str(row_dict.get("运单号", "")).strip()
+                    sev = str(row_dict.get("严重程度", "")).strip()
+                    cat = str(row_dict.get("类别", "")).strip()
+                    start = _normalize_time(row_dict.get("开始时间", ""))
+                    end = _normalize_time(row_dict.get("结束时间", ""))
+                    mins = _normalize_mins(row_dict.get("时长(分钟)", ""))
+                    temp = _normalize_temp(row_dict.get("温度(℃)", ""))
+                    key = f"{wb_no}|{_reverse_severity(sev)}|{_reverse_category(cat)}|{start}|{end}|{mins}|{temp}"
+                    notes[key] = {
+                        "处理状态": str(row_dict.get("处理状态", "")).strip(),
+                        "备注": str(row_dict.get("备注", "")).strip(),
+                        "处理人": str(row_dict.get("处理人", "")).strip(),
+                    }
+            wb.close()
+    except Exception as e:
+        click.echo(f"  警告：无法读取已有备注文件 → {e}", err=True)
+    return notes
+
+
+def _reverse_severity(label):
+    for k, v in _SEVERITY_LABEL.items():
+        if v == label:
+            return k
+    return label
+
+
+def _reverse_category(label):
+    for k, v in _CATEGORY_LABEL.items():
+        if v == label:
+            return k
+    return label
+
+
+def _write_exceptions_csv(filepath, items, note_template=False, existing_notes=None):
     _ensure_dir(filepath)
     with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         headers = ["序号", "严重程度", "类别", "运单号", "车牌", "设备编号",
                    "开始时间", "结束时间", "时长(分钟)", "温度(℃)", "详情"]
         if note_template:
-            headers += ["备注", "处理人"]
+            headers += ["处理状态", "备注", "处理人"]
         writer.writerow(headers)
-        for row in _build_exception_rows(items, note_template):
+        for row in _build_exception_rows(items, note_template, existing_notes):
             writer.writerow([row[h] for h in headers])
 
 
 @cli.command()
 @click.option("--month-dir", "-m", required=True,
-              help="月份文件夹路径（含运单清单和温度子目录）")
+              help="月份文件夹路径（含运单清单和温度子目录，支持多层）")
 @click.option("--temp-zone", "-z", default=None, help="覆盖温区标准（如 -18~-15 或 2-8）")
-@click.option("--output", "-o", default=None, help="汇总输出文件路径（XLSX，推荐）")
-def batch(month_dir, temp_zone, output):
-    """批量处理：扫描月份文件夹，按客户汇总，一次生成完整留痕报告"""
+@click.option("--output", "-o", default=None,
+              help="汇总输出文件路径（XLSX，推荐）；配合 --per-customer 会输出多份文件")
+@click.option("--per-customer", "-p", is_flag=True, default=False,
+              help="除总表外，为每个客户单独生成一份交付文件")
+@click.option("--overview-only", is_flag=True, default=False,
+              help="仅显示月底总览，不导出文件")
+@click.option("--merge-notes", default=None,
+              help="已有备注文件路径，导出时保留原说明")
+@click.option("--output-dir", "-d", default=None,
+              help="指定输出目录（配合 --per-customer 使用，默认在月份目录下生成 deliverables 子目录）")
+def batch(month_dir, temp_zone, output, per_customer, overview_only, merge_notes, output_dir):
+    """批量处理：递归扫描月份文件夹，按客户汇总，月底总览，生成完整留痕报告"""
     if not os.path.isdir(month_dir):
         click.echo(f"错误：月份文件夹不存在 → {month_dir}", err=True)
         sys.exit(1)
@@ -436,29 +567,29 @@ def batch(month_dir, temp_zone, output):
             sys.exit(1)
         click.echo(click.style(f"温区标准（命令行指定）：{override_zone.display()}", bold=True))
 
-    waybill_files = []
-    temp_dirs = []
-
-    for fname in sorted(os.listdir(month_dir)):
-        fpath = os.path.join(month_dir, fname)
-        if os.path.isfile(fpath) and fname.lower().endswith((".csv", ".xlsx", ".xls")):
-            waybill_files.append(fpath)
-        elif os.path.isdir(fpath):
-            temp_dirs.append(fpath)
+    waybill_files = find_waybill_files(month_dir)
+    all_temp_files = find_temperature_files(month_dir)
+    waybill_file_set = set(os.path.abspath(f) for f in waybill_files)
+    temp_files = [f for f in all_temp_files
+                  if os.path.abspath(f) not in waybill_file_set]
 
     if not waybill_files:
         click.echo(f"错误：月份文件夹中未找到运单清单文件 → {month_dir}", err=True)
         sys.exit(1)
 
+    click.echo("正在扫描文件...")
+    for wf in waybill_files:
+        rel = os.path.relpath(wf, month_dir)
+        click.echo(f"  运单 → {rel}")
+    for tf in temp_files:
+        rel = os.path.relpath(tf, month_dir)
+        click.echo(f"  温度 → {rel}")
+
     all_waybills = []
     for wf in waybill_files:
-        click.echo(f"加载运单 → {os.path.basename(wf)}")
         all_waybills.extend(load_waybills(wf))
 
-    all_readings = []
-    for td in temp_dirs:
-        click.echo(f"加载温度 → {os.path.basename(td)}/")
-        all_readings.extend(load_temperature_dir(td))
+    all_readings = load_temperature_dir(month_dir, recursive=True)
 
     click.echo(f"共加载 {len(all_waybills)} 条运单、{len(all_readings)} 条温度记录")
 
@@ -469,7 +600,19 @@ def batch(month_dir, temp_zone, output):
         cust = w.customer or "未指定客户"
         customer_waybills[cust].append(w)
 
-    customer_match = defaultdict(lambda: {"matched": 0, "no_data": 0, "exceptions": 0})
+    class CustomerStats:
+        def __init__(self):
+            self.total = 0
+            self.matched = 0
+            self.no_data = 0
+            self.has_exception = 0
+            self.max_over_temp = 0.0
+            self.exceptions = []
+            self.reports = []
+            self.match_result = None
+            self.waybills = []
+
+    customer_stats = defaultdict(CustomerStats)
     all_reports = []
     all_exceptions = []
 
@@ -478,73 +621,182 @@ def batch(month_dir, temp_zone, output):
         zone = override_zone or pair.waybill.temp_zone
         r = generate_report(pair.waybill, pair.readings, zone, pair.basis)
         all_reports.append(r)
-        customer_match[cust]["matched"] += 1
+        customer_stats[cust].reports.append(r)
+        customer_stats[cust].matched += 1
+        customer_stats[cust].total += 1
+        customer_stats[cust].waybills.append(pair.waybill)
+        if r.over_temp_minutes > customer_stats[cust].max_over_temp:
+            customer_stats[cust].max_over_temp = r.over_temp_minutes
         items = detect_exceptions(pair.waybill, pair.readings, zone)
         all_exceptions.extend(items)
+        customer_stats[cust].exceptions.extend(items)
         if items:
-            customer_match[cust]["exceptions"] += 1
+            customer_stats[cust].has_exception += 1
 
     for w in match_result.no_temp_data:
         cust = w.customer or "未指定客户"
         zone = override_zone or w.temp_zone
         r = generate_report(w, [], override_zone)
         all_reports.append(r)
-        customer_match[cust]["no_data"] += 1
+        customer_stats[cust].reports.append(r)
+        customer_stats[cust].no_data += 1
+        customer_stats[cust].total += 1
+        customer_stats[cust].waybills.append(w)
         items = detect_exceptions(w, [], zone)
         all_exceptions.extend(items)
+        customer_stats[cust].exceptions.extend(items)
         if items:
-            customer_match[cust]["exceptions"] += 1
+            customer_stats[cust].has_exception += 1
 
     click.echo()
     click.echo("=" * 70)
-    click.echo("批量处理结果 — 按客户汇总")
+    click.echo("月底总览 — 按客户风险排序")
     click.echo("=" * 70)
+
+    ranked_customers = sorted(
+        customer_stats.keys(),
+        key=lambda c: (
+            -customer_stats[c].has_exception / max(customer_stats[c].total, 1),
+            -customer_stats[c].max_over_temp,
+            -customer_stats[c].no_data,
+        ),
+    )
 
     total_wb = 0
     total_matched = 0
     total_no_data = 0
-    total_exceptions = 0
+    total_exception_wb = 0
 
-    for cust in sorted(customer_waybills.keys()):
-        cm = customer_match[cust]
-        wb_count = len(customer_waybills[cust])
-        total_wb += wb_count
-        total_matched += cm["matched"]
-        total_no_data += cm["no_data"]
-        total_exceptions += cm["exceptions"]
+    click.echo(
+        f"{'客户名称':<12} {'总票数':>6} {'有数据':>6} {'缺数据':>8} "
+        f"{'有异常':>6} {'异常率':>8} {'最高超温':>10}"
+    )
+    click.echo("-" * 72)
 
-        status_parts = [f"{wb_count}票"]
-        if cm["matched"]:
-            status_parts.append(click.style(f"有数据{cm['matched']}票", fg="green"))
-        if cm["no_data"]:
-            status_parts.append(click.style(f"缺数据{cm['no_data']}票", fg="red"))
-        if cm["exceptions"]:
-            status_parts.append(click.style(f"有异常{cm['exceptions']}票", fg="yellow"))
+    for cust in ranked_customers:
+        cs = customer_stats[cust]
+        total_wb += cs.total
+        total_matched += cs.matched
+        total_no_data += cs.no_data
+        total_exception_wb += cs.has_exception
 
-        click.echo(f"  {cust}：{' | '.join(status_parts)}")
+        exception_rate = cs.has_exception / cs.total * 100 if cs.total else 0
+        rate_str = f"{exception_rate:.0f}%"
+        max_ot_str = f"{cs.max_over_temp:.0f}分" if cs.max_over_temp > 0 else "—"
 
-    click.echo()
-    click.echo(f"  合计 {total_wb} 票运单 | "
-               f"有数据 {total_matched} | 缺数据 {total_no_data} | 有异常 {total_exceptions}")
+        line_parts = [f"{cust:<12} {cs.total:>6} {cs.matched:>6} {cs.no_data:>8} "
+                      f"{cs.has_exception:>6}"]
+        if exception_rate >= 50:
+            line_parts.append(click.style(f"{rate_str:>8}", fg="red"))
+        elif exception_rate >= 20:
+            line_parts.append(click.style(f"{rate_str:>8}", fg="yellow"))
+        else:
+            line_parts.append(click.style(f"{rate_str:>8}", fg="green"))
+        if cs.max_over_temp >= 30:
+            line_parts.append(click.style(f"{max_ot_str:>10}", fg="red"))
+        elif cs.max_over_temp >= 10:
+            line_parts.append(click.style(f"{max_ot_str:>10}", fg="yellow"))
+        else:
+            line_parts.append(f"{max_ot_str:>10}")
+
+        click.echo("".join(line_parts))
+
+    click.echo("-" * 72)
+    overall_rate = total_exception_wb / total_wb * 100 if total_wb else 0
+    overall_max_ot = max((cs.max_over_temp for cs in customer_stats.values()), default=0)
+    max_ot_str = f"{overall_max_ot:.0f}分" if overall_max_ot > 0 else "—"
+    click.echo(
+        f"{'合计':<12} {total_wb:>6} {total_matched:>6} {total_no_data:>8} "
+        f"{total_exception_wb:>6} {overall_rate:.0f}%  {max_ot_str:>10}"
+    )
+
+    if total_no_data > 0:
+        click.echo()
+        click.echo(click.style("⚠ 缺数据票数排行：", fg="yellow"))
+        no_data_ranked = sorted(
+            customer_stats.items(),
+            key=lambda x: -x[1].no_data,
+        )
+        for cust, cs in no_data_ranked:
+            if cs.no_data > 0:
+                click.echo(f"  {cust}: {cs.no_data} 票缺数据")
+
+    if overall_max_ot > 0:
+        click.echo()
+        click.echo(click.style("⚠ 最高超温时长排行：", fg="yellow"))
+        ot_ranked = sorted(
+            customer_stats.items(),
+            key=lambda x: -x[1].max_over_temp,
+        )
+        for cust, cs in ot_ranked:
+            if cs.max_over_temp > 0:
+                click.echo(f"  {cust}: {cs.max_over_temp:.0f} 分钟")
+
+    if overview_only:
+        return
+
+    existing_notes = {}
+    if merge_notes:
+        click.echo()
+        click.echo(f"正在合并已有备注 → {merge_notes}")
+        existing_notes = _load_existing_notes(merge_notes)
+        if existing_notes:
+            click.echo(f"  已读取 {len(existing_notes)} 条历史备注")
+
+    if not output and not per_customer:
+        click.echo()
+        click.echo("提示：使用 -o output.xlsx 可导出完整留痕报告")
+        click.echo("       使用 --per-customer 可按客户生成单独交付文件")
+        return
 
     if output:
         _ensure_dir(output)
         if not output.lower().endswith((".xlsx", ".xls")):
             output = output.rsplit(".", 1)[0] + ".xlsx"
             click.echo(f"提示：批量导出推荐 XLSX 格式，已自动调整为 → {output}")
-
         _export_full_excel(output, match_result, all_reports, override_zone,
-                           all_exceptions=all_exceptions)
-        click.echo(f"完整留痕报告已导出 → {output}")
-    else:
+                           all_exceptions=all_exceptions, existing_notes=existing_notes)
         click.echo()
-        click.echo("提示：使用 -o output.xlsx 可导出完整留痕报告（含匹配、摘要、异常三张表）")
+        click.echo(f"总汇总表已导出 → {output}")
+
+    if per_customer:
+        if output_dir is None:
+            output_dir = os.path.join(month_dir, "deliverables")
+        os.makedirs(output_dir, exist_ok=True)
+        click.echo()
+        click.echo(f"正在为每个客户生成单独交付文件 → {output_dir}/")
+
+        for cust in customer_stats.keys():
+            cs = customer_stats[cust]
+            safe_name = cust.replace("/", "_").replace("\\", "_").replace(":", "_")
+            customer_file = os.path.join(output_dir, f"{safe_name}_温度留痕.xlsx")
+
+            cust_match = type("obj", (), {})()
+            cust_match.matched = []
+            cust_match.no_temp_data = []
+            for pair in match_result.matched:
+                if pair.waybill.customer == cust:
+                    cust_match.matched.append(pair)
+            for w in match_result.no_temp_data:
+                if w.customer == cust:
+                    cust_match.no_temp_data.append(w)
+
+            _export_full_excel(
+                customer_file, cust_match, cs.reports, override_zone,
+                all_exceptions=cs.exceptions,
+                existing_notes=existing_notes,
+                customer_name=cust,
+            )
+            click.echo(f"  ✓ {cust} → {os.path.basename(customer_file)}")
+
+        click.echo(f"共 {len(customer_stats)} 份客户交付文件已生成")
 
 
 def _export_full_excel(filepath, match_result, reports, override_zone,
-                       all_exceptions=None):
+                       all_exceptions=None, existing_notes=None, customer_name=None):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
 
     wb = openpyxl.Workbook()
 
@@ -558,10 +810,16 @@ def _export_full_excel(filepath, match_result, reports, override_zone,
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
 
+    title_font = Font(bold=True, size=14)
+
     ws1 = wb.active
     ws1.title = "匹配结果"
+    if customer_name:
+        ws1.cell(row=1, column=1, value=f"冷链运单温度留痕报告 — {customer_name}").font = title_font
     match_rows = _build_match_rows(match_result)
-    _write_sheet(ws1, match_rows, header_font, header_fill, header_font_white, thin_border)
+    start_row = 3 if customer_name else 1
+    _write_sheet(ws1, match_rows, header_font, header_fill, header_font_white, thin_border,
+                 start_row=start_row)
 
     ws2 = wb.create_sheet("温度摘要")
     report_rows = _build_report_rows(reports)
@@ -573,16 +831,43 @@ def _export_full_excel(filepath, match_result, reports, override_zone,
 
     if all_exceptions is not None:
         ws4 = wb.create_sheet("异常清单")
-        exc_rows = _build_exception_rows(all_exceptions, note_template=True)
+        exc_rows = _build_exception_rows(all_exceptions, note_template=True,
+                                         existing_notes=existing_notes)
         _write_sheet(ws4, exc_rows, header_font, header_fill, header_font_white, thin_border)
-        for row_idx in range(2, ws4.max_row + 1):
-            sev_cell = ws4.cell(row=row_idx, column=2)
-            if sev_cell.value == "严重":
-                for col_idx in range(1, ws4.max_column + 1):
-                    ws4.cell(row=row_idx, column=col_idx).fill = high_fill
-            elif sev_cell.value == "中等":
-                for col_idx in range(1, ws4.max_column + 1):
-                    ws4.cell(row=row_idx, column=col_idx).fill = medium_fill
+
+        headers = list(exc_rows[0].keys()) if exc_rows else []
+        sev_col_idx = None
+        status_col_idx = None
+        for idx, h in enumerate(headers, 1):
+            if h == "严重程度":
+                sev_col_idx = idx
+            if h == "处理状态":
+                status_col_idx = idx
+
+        if sev_col_idx:
+            for row_idx in range(2, ws4.max_row + 1):
+                sev_cell = ws4.cell(row=row_idx, column=sev_col_idx)
+                if sev_cell.value == "严重":
+                    for col_idx in range(1, ws4.max_column + 1):
+                        ws4.cell(row=row_idx, column=col_idx).fill = high_fill
+                elif sev_cell.value == "中等":
+                    for col_idx in range(1, ws4.max_column + 1):
+                        ws4.cell(row=row_idx, column=col_idx).fill = medium_fill
+
+        if status_col_idx:
+            status_col_letter = openpyxl.utils.get_column_letter(status_col_idx)
+            dv = DataValidation(
+                type="list",
+                formula1='"已处理,待客户确认,无需处理"',
+                allow_blank=True,
+                showDropDown=False,
+            )
+            dv.error = "请从下拉列表选择"
+            dv.errorTitle = "无效输入"
+            dv.prompt = "请选择处理状态：已处理 / 待客户确认 / 无需处理"
+            dv.promptTitle = "处理状态"
+            ws4.add_data_validation(dv)
+            dv.add(f"{status_col_letter}2:{status_col_letter}{ws4.max_row}")
 
     for ws in wb.worksheets:
         for col in ws.columns:
@@ -596,28 +881,30 @@ def _export_full_excel(filepath, match_result, reports, override_zone,
     wb.save(filepath)
 
 
-def _write_sheet(ws, rows, header_font, header_fill, header_font_white, thin_border):
+def _write_sheet(ws, rows, header_font, header_fill, header_font_white, thin_border,
+                 start_row=1):
     from openpyxl.styles import Alignment
     if not rows:
         return
     headers = list(rows[0].keys())
     for col_idx, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell = ws.cell(row=start_row, column=col_idx, value=h)
         cell.font = header_font_white
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = thin_border
 
-    for row_idx, row_data in enumerate(rows, 2):
+    for row_idx, row_data in enumerate(rows, start_row + 1):
         for col_idx, h in enumerate(headers, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=row_data.get(h, ""))
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center")
 
 
-def _write_excel(filepath, rows, sheet_name="Sheet1"):
+def _write_excel(filepath, rows, sheet_name="Sheet1", highlight_severity=False):
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -625,12 +912,49 @@ def _write_excel(filepath, rows, sheet_name="Sheet1"):
 
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    high_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    medium_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
     thin_border = Border(
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
 
     _write_sheet(ws, rows, header_font, header_fill, header_font, thin_border)
+
+    if highlight_severity:
+        headers = list(rows[0].keys()) if rows else []
+        sev_col_idx = None
+        status_col_idx = None
+        for idx, h in enumerate(headers, 1):
+            if h == "严重程度":
+                sev_col_idx = idx
+            if h == "处理状态":
+                status_col_idx = idx
+
+        if sev_col_idx:
+            for row_idx in range(2, ws.max_row + 1):
+                sev_cell = ws.cell(row=row_idx, column=sev_col_idx)
+                if sev_cell.value == "严重":
+                    for col_idx in range(1, ws.max_column + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = high_fill
+                elif sev_cell.value == "中等":
+                    for col_idx in range(1, ws.max_column + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = medium_fill
+
+        if status_col_idx:
+            status_col_letter = openpyxl.utils.get_column_letter(status_col_idx)
+            dv = DataValidation(
+                type="list",
+                formula1='"已处理,待客户确认,无需处理"',
+                allow_blank=True,
+                showDropDown=False,
+            )
+            dv.error = "请从下拉列表选择"
+            dv.errorTitle = "无效输入"
+            dv.prompt = "请选择处理状态：已处理 / 待客户确认 / 无需处理"
+            dv.promptTitle = "处理状态"
+            ws.add_data_validation(dv)
+            dv.add(f"{status_col_letter}2:{status_col_letter}{ws.max_row}")
 
     for col in ws.columns:
         max_len = 0

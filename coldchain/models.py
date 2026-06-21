@@ -131,8 +131,39 @@ class ExceptionItem:
     detail: str = ""
     minutes: float = 0.0
     temperature: Optional[float] = None
+    remark: str = ""
+    handler: str = ""
+    status: str = ""
 
     SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+    STATUS_OPTIONS = ["", "已处理", "待客户确认", "无需处理"]
 
     def sort_key(self):
         return (self.SEVERITY_ORDER.get(self.severity, 9), self.start_time or datetime.min)
+
+    def unique_key(self):
+        def _fmt_temp(val):
+            if val is None:
+                return ""
+            try:
+                v = float(val)
+                if v == int(v):
+                    return str(int(v))
+                return str(v)
+            except (ValueError, TypeError):
+                return str(val)
+
+        parts = [
+            self.waybill_no, self.severity, self.category,
+            _fmt_dt(self.start_time),
+            _fmt_dt(self.end_time),
+            f"{self.minutes:.1f}" if self.minutes is not None else "",
+            _fmt_temp(self.temperature),
+        ]
+        return "|".join(parts)
+
+
+def _fmt_dt(dt):
+    if dt is None:
+        return ""
+    return dt.strftime("%Y-%m-%d %H:%M")
